@@ -1,0 +1,31 @@
+{
+  "name": "agent-flight-recorder",
+  "version": "0.1.0",
+  "description": "Tamper-evident agent audit trail sealed to Filecoin Onchain Cloud. Receipts, not self-reports.",
+  "type": "module",
+  "bin": {
+    "afr": "./bin/afr.js"
+  },
+  "scripts": {
+    "demo": "./demo.sh",
+    "test": "node --test 'test/*.test.js'"
+  },
+  "keywords": [
+    "filecoin",
+    "filecoin-onchain-cloud",
+    "ai-agents",
+    "audit-trail",
+    "provenance",
+    "claude-code"
+  ],
+  "author": "Russell Dempsey <sgtpooki@gmail.com>",
+  "license": "Apache-2.0 OR MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@filoz/synapse-sdk": "^0.41.0",
+    "filecoin-pin": "^0.23.2",
+    "multiformats": "^13.0.0"
+  }
+}

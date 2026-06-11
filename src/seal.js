@@ -1,0 +1,142 @@
+/**
+ * Seal the flight-recorder log to Filecoin Onchain Cloud.
+ *
+ * The log file + a manifest committing to the chain root are packed into a
+ * UnixFS CAR and uploaded to Filecoin Warm Storage via the Synapse SDK
+ * (through filecoin-pin's core API). Daily PDP proofs then keep attesting,
+ * onchain, that the sealed log still exists bit-for-bit.
+ */
+import { promises as fs } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { depositUSDFC, getPaymentStatus } from 'filecoin-pin/core/payments'
+import { calibration, initializeSynapse, mainnet } from 'filecoin-pin/core/synapse'
+import { cleanupTempCar, createCarFromPath } from 'filecoin-pin/core/unixfs'
+import { checkUploadReadiness, executeUpload } from 'filecoin-pin/core/upload'
+import { readLog, verifyChain } from './chain.js'
+
+const CHAINS = { calibration, mainnet }
+
+/** Accept private keys with or without the 0x prefix. */
+function normalizeKey(privateKey) {
+  const k = privateKey.trim()
+  return k.startsWith('0x') ? k : `0x${k}`
+}
+
+function makeLogger(verbose) {
+  const log = (level) => (...args) => {
+    if (verbose) console.error(`[${level}]`, ...args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))))
+  }
+  const logger = {
+    info: log('info'),
+    warn: log('warn'),
+    error: (...args) => console.error('[error]', ...args),
+    debug: log('debug'),
+    trace: log('trace'),
+    fatal: (...args) => console.error('[fatal]', ...args),
+    level: verbose ? 'debug' : 'error',
+  }
+  logger.child = () => logger
+  return logger
+}
+
+/**
+ * @param {string} logPath - path to log.jsonl
+ * @param {{privateKey: string, network?: 'mainnet'|'calibration', verbose?: boolean, onStatus?: (msg: string) => void}} opts
+ */
+export async function seal(logPath, opts) {
+  const { privateKey, network = 'calibration', verbose = false, onStatus = () => {} } = opts
+  const logger = makeLogger(verbose)
+  const chain = CHAINS[network]
+  if (!chain) throw new Error(`unsupported network: ${network}`)
+
+  const records = await readLog(logPath)
+  if (records.length === 0) throw new Error(`nothing to seal: ${logPath} is empty or missing`)
+  const result = verifyChain(records)
+  if (!result.ok) {
+    throw new Error(
+      `refusing to seal a broken chain (${result.failures.length} failure(s)). Run \`afr verify\` for details.`
+    )
+  }
+
+  // Stage log + manifest in a temp dir so both land under one IPFS root CID
+  const manifest = {
+    type: 'agent-flight-recorder/seal',
+    version: 1,
+    sealedAt: new Date().toISOString(),
+    records: result.count,
+    chainRoot: result.root,
+  }
+  const stageDir = await fs.mkdtemp(path.join(os.tmpdir(), 'afr-seal-'))
+  await fs.copyFile(logPath, path.join(stageDir, 'log.jsonl'))
+  await fs.writeFile(path.join(stageDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+
+  onStatus('packing log into CAR (UnixFS)')
+  const { carPath, rootCid } = await createCarFromPath(stageDir, { isDirectory: true, logger })
+  const carBytes = await fs.readFile(carPath)
+
+  onStatus(`connecting to Filecoin ${network}`)
+  const synapse = await initializeSynapse({ privateKey: normalizeKey(privateKey), chain }, logger)
+
+  try {
+    onStatus('checking payment readiness (FIL gas, USDFC deposit, WarmStorage allowances)')
+    let readiness = await checkUploadReadiness({ synapse, fileSize: carBytes.length })
+
+    // Self-fund: if only the Filecoin Pay deposit is short and the wallet has
+    // USDFC, deposit the shortfall (with buffer) and re-check.
+    const shortfall = readiness.capacity?.issues?.insufficientDeposit
+    if (readiness.status !== 'ready' && shortfall && (readiness.walletUsdfcBalance ?? 0n) > 0n) {
+      const topUp = shortfall * 2n > 10n ** 18n ? shortfall * 2n : 10n ** 18n // at least 1 USDFC
+      onStatus(`depositing ${Number(topUp) / 1e18} USDFC into Filecoin Pay (agent self-funds its storage)`)
+      await depositUSDFC(synapse, topUp)
+      readiness = await checkUploadReadiness({ synapse, fileSize: carBytes.length })
+    }
+
+    if (readiness.status !== 'ready') {
+      const why = readiness.validation.errorMessage ?? 'payment setup is not ready'
+      const help = [readiness.validation.helpMessage, ...readiness.suggestions].filter(Boolean).join('\n')
+      throw new Error(`${why}${help ? `\n${help}` : ''}`)
+    }
+
+    onStatus(`uploading ${carBytes.length} bytes to Filecoin Warm Storage`)
+    const upload = await executeUpload(synapse, carBytes, rootCid, {
+      logger,
+      contextId: `afr-seal-${manifest.sealedAt}`,
+      ipniValidation: { enabled: false },
+      pieceMetadata: { afrChainRoot: result.root ?? '' },
+    })
+
+    const receipt = {
+      ...manifest,
+      network: upload.network,
+      ipfsRootCid: rootCid.toString(),
+      pieceCid: upload.pieceCid.toString(),
+      size: upload.size,
+      copies: upload.copies.map((c) => ({
+        providerId: String(c.providerId),
+        dataSetId: String(c.dataSetId),
+        pieceId: String(c.pieceId),
+        retrievalUrl: c.retrievalUrl,
+      })),
+      gatewayURL: `https://dweb.link/ipfs/${rootCid.toString()}/log.jsonl`,
+    }
+    const receiptPath = path.join(path.dirname(logPath), 'seal-receipt.json')
+    await fs.writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`)
+    return { receipt, receiptPath }
+  } finally {
+    await cleanupTempCar(carPath).catch(() => {})
+    await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+/**
+ * Check wallet/payment readiness without uploading anything.
+ * @param {{privateKey: string, network?: 'mainnet'|'calibration'}} opts
+ */
+export async function paymentStatus(opts) {
+  const { privateKey, network = 'calibration' } = opts
+  const chain = CHAINS[network]
+  if (!chain) throw new Error(`unsupported network: ${network}`)
+  const synapse = await initializeSynapse({ privateKey: normalizeKey(privateKey), chain }, makeLogger(false))
+  return getPaymentStatus(synapse)
+}

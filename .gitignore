@@ -1,0 +1,5 @@
+node_modules/
+.afr/
+.afr-demo/
+.env
+*.log
