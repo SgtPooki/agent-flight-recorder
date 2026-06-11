@@ -13,6 +13,7 @@ import { depositUSDFC, getPaymentStatus } from 'filecoin-pin/core/payments'
 import { calibration, initializeSynapse, mainnet } from 'filecoin-pin/core/synapse'
 import { cleanupTempCar, createCarFromPath } from 'filecoin-pin/core/unixfs'
 import { checkUploadReadiness, executeUpload } from 'filecoin-pin/core/upload'
+import { privateKeyToAccount } from 'viem/accounts'
 import { readLog, verifyChain } from './chain.js'
 
 const CHAINS = { calibration, mainnet }
@@ -59,6 +60,11 @@ export async function seal(logPath, opts) {
     )
   }
 
+  // Sign the chain root with the sealing wallet. The manifest then binds the
+  // history to an onchain identity, not just to "whoever uploaded a file".
+  const account = privateKeyToAccount(normalizeKey(privateKey))
+  const signature = await account.signMessage({ message: result.root })
+
   // Stage log + manifest in a temp dir so both land under one IPFS root CID
   const manifest = {
     type: 'agent-flight-recorder/seal',
@@ -66,6 +72,8 @@ export async function seal(logPath, opts) {
     sealedAt: new Date().toISOString(),
     records: result.count,
     chainRoot: result.root,
+    signer: account.address,
+    rootSignature: signature,
   }
   const stageDir = await fs.mkdtemp(path.join(os.tmpdir(), 'afr-seal-'))
   await fs.copyFile(logPath, path.join(stageDir, 'log.jsonl'))
@@ -83,10 +91,26 @@ export async function seal(logPath, opts) {
     let readiness = await checkUploadReadiness({ synapse, fileSize: carBytes.length })
 
     // Self-fund: if only the Filecoin Pay deposit is short and the wallet has
-    // USDFC, deposit the shortfall (with buffer) and re-check.
+    // USDFC, deposit the shortfall (with buffer) and re-check. Capped by
+    // AFR_MAX_TOPUP_USDFC (default 5) so a buggy or hostile capacity check
+    // can't move more than that in one seal. Off on mainnet unless
+    // AFR_AUTO_FUND=1.
     const shortfall = readiness.capacity?.issues?.insufficientDeposit
     if (readiness.status !== 'ready' && shortfall && (readiness.walletUsdfcBalance ?? 0n) > 0n) {
-      const topUp = shortfall * 2n > 10n ** 18n ? shortfall * 2n : 10n ** 18n // at least 1 USDFC
+      if (network === 'mainnet' && process.env.AFR_AUTO_FUND !== '1') {
+        throw new Error(
+          'deposit is short and auto-funding is disabled on mainnet. Set AFR_AUTO_FUND=1 to allow it, or deposit USDFC manually.'
+        )
+      }
+      const ONE_USDFC = 10n ** 18n
+      const maxTopUp = BigInt(Math.round(Number(process.env.AFR_MAX_TOPUP_USDFC || '5') * 1e6)) * 10n ** 12n
+      let topUp = shortfall * 2n > ONE_USDFC ? shortfall * 2n : ONE_USDFC
+      if (topUp > maxTopUp) topUp = maxTopUp
+      if (topUp < shortfall) {
+        throw new Error(
+          `deposit shortfall (${Number(shortfall) / 1e18} USDFC) exceeds AFR_MAX_TOPUP_USDFC (${Number(maxTopUp) / 1e18}). Raise the cap or deposit manually.`
+        )
+      }
       onStatus(`depositing ${Number(topUp) / 1e18} USDFC into Filecoin Pay (agent self-funds its storage)`)
       await depositUSDFC(synapse, topUp)
       readiness = await checkUploadReadiness({ synapse, fileSize: carBytes.length })

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * afr — Agent Flight Recorder
+ * afr: Agent Flight Recorder
  *
  * Tamper-evident audit trail for AI agents, sealed to Filecoin Onchain Cloud.
  *
@@ -36,13 +36,20 @@ const c = {
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex')
 
+const MAX_STDIN_BYTES = 1 << 20 // hook payloads are small; cap to keep a hostile one from eating memory
+
 async function readStdin() {
   const chunks = []
-  for await (const chunk of process.stdin) chunks.push(chunk)
+  let size = 0
+  for await (const chunk of process.stdin) {
+    size += chunk.length
+    if (size > MAX_STDIN_BYTES) throw new Error(`stdin exceeds ${MAX_STDIN_BYTES} bytes`)
+    chunks.push(chunk)
+  }
   return Buffer.concat(chunks).toString('utf8')
 }
 
-/** `afr record` — Claude Code hook entrypoint (PostToolUse, UserPromptSubmit, Stop, ...) */
+/** `afr record`: Claude Code hook entrypoint (PostToolUse, UserPromptSubmit, Stop, ...) */
 async function cmdRecord() {
   const raw = await readStdin()
   let payload
@@ -60,7 +67,9 @@ async function cmdRecord() {
     inputDigest: payload.tool_input !== undefined ? sha256(JSON.stringify(payload.tool_input)) : undefined,
     outputDigest: payload.tool_response !== undefined ? sha256(JSON.stringify(payload.tool_response)) : undefined,
     promptDigest: payload.prompt !== undefined ? sha256(payload.prompt) : undefined,
-    preview: preview(payload),
+    // Cleartext previews are opt-in: seals publish the log to PUBLIC storage,
+    // permanently. Digest-only records prove what happened without leaking it.
+    preview: process.env.AFR_PREVIEW === '1' ? preview(payload) : undefined,
   }
   for (const k of Object.keys(data)) data[k] === undefined && delete data[k]
   const record = await appendRecord(LOG_PATH, session, event, data)
@@ -78,7 +87,7 @@ function preview(payload) {
   return flat.length > 140 ? `${flat.slice(0, 140)}…` : flat
 }
 
-/** `afr note <text>` — free-form record, handy for demos and milestones */
+/** `afr note <text>`: free-form record, handy for demos and milestones */
 async function cmdNote(args) {
   const text = args.join(' ').trim()
   if (!text) die('usage: afr note <text>')
@@ -89,7 +98,7 @@ async function cmdNote(args) {
 async function cmdLog() {
   const records = await readLog(LOG_PATH)
   if (records.length === 0) die(`no records at ${LOG_PATH}`)
-  console.log(c.bold(`\n  Agent Flight Recorder — ${records.length} records\n`))
+  console.log(c.bold(`\n  Agent Flight Recorder.. ${records.length} records\n`))
   for (const r of records) {
     const label = r.data?.tool ? `${r.event}:${r.data.tool}` : r.event
     const desc = r.data?.preview ?? r.data?.text ?? ''
@@ -114,7 +123,7 @@ async function cmdVerify(args) {
   if (result.ok) {
     console.log(`  ${c.green('✓')} ${result.count} records, every hash links: chain is intact`)
   } else {
-    console.log(`\n  ${c.red(`✗ TAMPERED — ${result.failures.length} integrity failure(s). This history has been altered.`)}`)
+    console.log(`\n  ${c.red(`✗ TAMPERED: ${result.failures.length} integrity failure(s). This history has been altered.`)}`)
   }
   console.log(`  ${c.dim('local chain root:')} ${result.root ?? '(none)'}`)
 
@@ -138,36 +147,87 @@ async function cmdVerify(args) {
     if (receipt.copies?.length > 0) {
       console.log(`  ${c.dim('piece:')} ${receipt.pieceCid}`)
       for (const copy of receipt.copies) {
-        console.log(`  ${c.dim(`provider #${copy.providerId}, data set #${copy.dataSetId}, piece #${copy.pieceId} — PDP-proven daily`)}`)
+        console.log(`  ${c.dim(`provider #${copy.providerId}, data set #${copy.dataSetId}, piece #${copy.pieceId}, PDP-proven daily`)}`)
       }
     }
   } else if (remote) {
-    die('no seal receipt found — run `afr seal` first')
+    die('no seal receipt found.. run `afr seal` first')
   } else {
-    console.log(`\n  ${c.dim('no seal receipt — run `afr seal` to anchor this chain to Filecoin')}`)
+    console.log(`\n  ${c.dim('no seal receipt.. run `afr seal` to anchor this chain to Filecoin')}`)
   }
 
+  let remoteOk = true
   if (remote && receipt) {
-    const url = receipt.gatewayURL
-    console.log(`\n  ${c.bold('Remote verify')} — fetching the sealed log back from Filecoin`)
-    console.log(`  ${c.dim(url)}`)
-    const res = await fetch(url)
-    if (!res.ok) die(`fetch failed: ${res.status} ${res.statusText} (gateway may still be propagating — try the provider retrievalUrl in ${RECEIPT_PATH})`)
-    const remoteText = await res.text()
-    const remoteRecords = remoteText
-      .split('\n')
-      .filter((l) => l.trim())
-      .map((l) => JSON.parse(l))
-    const remoteResult = verifyChain(remoteRecords)
-    if (remoteResult.ok && remoteResult.root === receipt.chainRoot) {
-      console.log(`  ${c.green('✓')} Filecoin's copy verifies independently: ${remoteResult.count} records, root ${short(remoteResult.root)}`)
-    } else {
-      console.log(`  ${c.red('✗')} remote copy mismatch — this should never happen (root ${short(remoteResult.root)})`)
-    }
+    remoteOk = await remoteVerify(receipt, args)
   }
 
   console.log()
-  if (!result.ok) process.exit(1)
+  if (!result.ok || !remoteOk) process.exit(1)
+}
+
+/**
+ * Fetch the sealed log AND manifest back from content-addressed storage and
+ * verify them independently of local state. The IPFS root CID pins the
+ * content; an `--ipfs-root <cid>` argument (or a CID recorded somewhere you
+ * trust, like a transaction or a registry) removes even the local receipt
+ * from the trust path.
+ */
+async function remoteVerify(receipt, args) {
+  const cidFlag = args.indexOf('--ipfs-root')
+  const ipfsRoot = cidFlag !== -1 ? args[cidFlag + 1] : receipt.ipfsRootCid
+  if (!ipfsRoot) {
+    console.log(`  ${c.red('✗')} no IPFS root CID available`)
+    return false
+  }
+  const base = `https://dweb.link/ipfs/${ipfsRoot}`
+  console.log(`\n  ${c.bold('Remote verify')}: fetching the sealed log back from Filecoin`)
+  console.log(`  ${c.dim(base)}`)
+
+  let manifest, remoteText
+  try {
+    const [manifestRes, logRes] = await Promise.all([fetch(`${base}/manifest.json`), fetch(`${base}/log.jsonl`)])
+    if (!manifestRes.ok || !logRes.ok) {
+      console.log(`  ${c.red('✗')} fetch failed (${manifestRes.status}/${logRes.status}). Gateway may still be propagating; try the provider retrievalUrl in ${RECEIPT_PATH}`)
+      return false
+    }
+    manifest = await manifestRes.json()
+    remoteText = await logRes.text()
+  } catch (err) {
+    console.log(`  ${c.red('✗')} fetch failed: ${err.message}`)
+    return false
+  }
+
+  let remoteRecords
+  try {
+    remoteRecords = remoteText
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l))
+  } catch (err) {
+    console.log(`  ${c.red('✗')} sealed log is not valid JSONL: ${err.message}`)
+    return false
+  }
+
+  const remoteResult = verifyChain(remoteRecords)
+  if (!remoteResult.ok || remoteResult.root !== manifest.chainRoot) {
+    console.log(`  ${c.red('✗')} sealed copy does not verify (root ${short(remoteResult.root)}, manifest claims ${short(manifest.chainRoot)})`)
+    return false
+  }
+  console.log(`  ${c.green('✓')} sealed copy verifies independently: ${remoteResult.count} records, root ${short(remoteResult.root)}`)
+
+  if (manifest.rootSignature && manifest.signer) {
+    const { recoverMessageAddress } = await import('viem')
+    const recovered = await recoverMessageAddress({ message: manifest.chainRoot, signature: manifest.rootSignature })
+    if (recovered.toLowerCase() === manifest.signer.toLowerCase()) {
+      console.log(`  ${c.green('✓')} chain root signed by ${recovered}`)
+    } else {
+      console.log(`  ${c.red('✗')} root signature does not match claimed signer ${manifest.signer}`)
+      return false
+    }
+  } else {
+    console.log(`  ${c.dim('(unsigned seal: no identity binding)')}`)
+  }
+  return true
 }
 
 async function cmdSeal(args) {
@@ -184,6 +244,7 @@ async function cmdSeal(args) {
   })
   console.log(`\n  ${c.green('✓ sealed')}`)
   console.log(`  chain root : ${c.bold(receipt.chainRoot)}`)
+  console.log(`  signed by  : ${receipt.signer}`)
   console.log(`  records    : ${receipt.records}`)
   console.log(`  IPFS root  : ${receipt.ipfsRootCid}`)
   console.log(`  piece CID  : ${receipt.pieceCid}`)
@@ -238,7 +299,7 @@ try {
       await cmdStatus()
       break
     default:
-      console.log(`afr — Agent Flight Recorder
+      console.log(`afr: Agent Flight Recorder
 
   usage: afr <record|note|log|verify|seal|status>
 
@@ -246,11 +307,15 @@ try {
   note <text>      append a free-form note record
   log              pretty-print the hash chain
   verify           recompute every hash; compare to the seal receipt
-  verify --remote  also fetch the sealed log back from Filecoin and verify it
-  seal             upload log + manifest to Filecoin Warm Storage (PRIVATE_KEY)
+  verify --remote  fetch the sealed log + manifest back from Filecoin, verify the
+                   chain and root signature (--ipfs-root <cid> skips the receipt)
+  seal             sign the chain root, upload log + manifest (PRIVATE_KEY)
   status           wallet / Filecoin Pay readiness (PRIVATE_KEY)
 
-  env: AFR_DIR (default ./.afr), AFR_NETWORK (calibration|mainnet), PRIVATE_KEY`)
+  env: AFR_DIR (default ./.afr), AFR_NETWORK (calibration|mainnet), PRIVATE_KEY,
+       AFR_PREVIEW=1 (cleartext previews, off by default),
+       AFR_MAX_TOPUP_USDFC (auto-deposit cap, default 5),
+       AFR_AUTO_FUND=1 (required for auto-deposit on mainnet)`)
   }
 } catch (err) {
   die(err.message)

@@ -78,11 +78,21 @@ export async function appendRecord(logPath, session, event, data) {
 export function verifyChain(records) {
   const failures = []
   let prev = GENESIS
+  let expectedSeq = 0
+  let lastTs = ''
   for (const r of records) {
     if (r.event === 'UNPARSEABLE') {
       failures.push({ seq: r.seq, reason: 'record is not valid JSON (corrupted line)' })
       continue
     }
+    if (r.seq !== expectedSeq) {
+      failures.push({ seq: r.seq, reason: `sequence gap: got #${r.seq}, expected #${expectedSeq}` })
+    }
+    expectedSeq = (r.seq ?? expectedSeq) + 1
+    if (typeof r.ts === 'string' && r.ts < lastTs) {
+      failures.push({ seq: r.seq, reason: `timestamp went backwards: ${r.ts} after ${lastTs}` })
+    }
+    if (typeof r.ts === 'string') lastTs = r.ts
     if (r.prev !== prev) {
       failures.push({ seq: r.seq, reason: `broken link: prev is ${short(r.prev)}, expected ${short(prev)}` })
     }

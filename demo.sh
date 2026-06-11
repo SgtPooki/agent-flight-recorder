@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Agent Flight Recorder — 3-minute demo script
+# Agent Flight Recorder demo script (3 minutes)
 #
 #   ./demo.sh          local-only (record → verify → tamper → catch it)
 #   PRIVATE_KEY=0x... ./demo.sh seal   also seal to Filecoin calibration + remote-verify
@@ -8,6 +8,11 @@ cd "$(dirname "$0")"
 
 AFR="node bin/afr.js"
 export AFR_DIR="${AFR_DIR:-$PWD/.afr-demo}"
+# Previews are opt-in because seals publish them. This demo's data is synthetic.
+export AFR_PREVIEW=1
+case "$AFR_DIR" in
+  ""|/|"$HOME") echo "refusing to wipe AFR_DIR='$AFR_DIR'" >&2; exit 1 ;;
+esac
 rm -rf "$AFR_DIR"
 
 step() { printf '\n\033[1;35m▶ %s\033[0m\n' "$*"; read -r -t "${DEMO_PAUSE:-0}" _ 2>/dev/null || true; }
@@ -38,14 +43,14 @@ node -e '
   r.data.preview = r.data.preview.replace("--amount 12000", "--amount 1200000")
   lines[2] = JSON.stringify(r)
   fs.writeFileSync(process.argv[1], lines.join("\n") + "\n")
-  console.log("  (edited record #2 in place — same file, same length, looks plausible)")
+  console.log("  (edited record #2 in place.. same file, same length, looks plausible)")
 ' "$LOG"
 
 step "5. Verify again: the chain catches it instantly."
 $AFR verify && exit 1 || true
 
 if [ "${1:-}" = "seal" ]; then
-  step "6. And Filecoin still holds the original — fetch it back and verify independently."
+  step "6. And Filecoin still holds the original.. fetch it back and verify independently."
   $AFR verify --remote || true
 fi
 
