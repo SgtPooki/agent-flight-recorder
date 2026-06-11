@@ -225,7 +225,10 @@ async function remoteVerify(receipt, args) {
       return false
     }
   } else {
-    console.log(`  ${c.dim('(unsigned seal: no identity binding)')}`)
+    // Without a signature, a gateway could serve a self-consistent forged
+    // log+manifest pair. Treat unsigned seals as a verification failure.
+    console.log(`  ${c.red('✗')} seal is unsigned: remote content cannot be tied to any identity`)
+    return false
   }
   return true
 }

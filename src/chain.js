@@ -47,6 +47,37 @@ export async function readLog(logPath) {
 }
 
 /**
+ * Take an exclusive lock around read+append. Claude Code runs tool calls in
+ * parallel, so two hooks can race the read-modify-append and fork the chain;
+ * mkdir is atomic on every platform, which makes it a sufficient mutex.
+ * @param {string} logPath
+ */
+async function withLock(logPath, fn) {
+  const lockDir = `${logPath}.lock`
+  const deadline = Date.now() + 10_000
+  for (;;) {
+    try {
+      await fs.mkdir(lockDir)
+      break
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err
+      if (Date.now() > deadline) {
+        // A crashed holder leaves the lock behind; steal it after the deadline
+        // rather than silently dropping the record.
+        await fs.rm(lockDir, { recursive: true, force: true })
+        continue
+      }
+      await new Promise((r) => setTimeout(r, 25))
+    }
+  }
+  try {
+    return await fn()
+  } finally {
+    await fs.rm(lockDir, { recursive: true, force: true })
+  }
+}
+
+/**
  * Append an event to the log, chaining it to the last record.
  * @param {string} logPath
  * @param {string} session
@@ -55,19 +86,21 @@ export async function readLog(logPath) {
  */
 export async function appendRecord(logPath, session, event, data) {
   await fs.mkdir(path.dirname(logPath), { recursive: true })
-  const records = await readLog(logPath)
-  const last = records[records.length - 1]
-  const record = {
-    seq: last ? last.seq + 1 : 0,
-    ts: new Date().toISOString(),
-    session,
-    event,
-    data,
-    prev: last ? last.hash : GENESIS,
-  }
-  record.hash = recordHash(record)
-  await fs.appendFile(logPath, `${JSON.stringify(record)}\n`)
-  return record
+  return withLock(logPath, async () => {
+    const records = await readLog(logPath)
+    const last = records[records.length - 1]
+    const record = {
+      seq: last ? last.seq + 1 : 0,
+      ts: new Date().toISOString(),
+      session,
+      event,
+      data,
+      prev: last ? last.hash : GENESIS,
+    }
+    record.hash = recordHash(record)
+    await fs.appendFile(logPath, `${JSON.stringify(record)}\n`)
+    return record
+  })
 }
 
 /**

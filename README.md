@@ -6,7 +6,7 @@ Receipts, not self-reports. A tamper-evident audit trail for AI agents, sealed t
 
 An AI agent is a kid with your credit card. Afterwards, the kid tells you what it bought.. but the kid writes its own diary, and whoever holds the diary can rewrite it.
 
-The flight recorder makes the diary special: every page includes a fingerprint of the page before it, so ripping out or editing a page smudges every fingerprint after it. Then we mail a sealed copy to a public vault nobody controls (Filecoin), and the vault keeps proving, every day, that it still holds the original.
+The flight recorder makes the diary special: every page includes a fingerprint of the page before it, so ripping out or editing a page smudges every fingerprint after it. Then we mail a sealed copy to a public vault that neither the kid nor the diary's owner controls (Filecoin), and the vault keeps proving, every day, that it still holds the original. Protection starts at the moment of sealing.. pages written before the seal but never mailed were never protected.
 
 Now when someone says "the agent only refunded $120," you don't have to trust the diary's owner. Check the vault.
 

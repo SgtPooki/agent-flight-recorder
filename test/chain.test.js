@@ -50,6 +50,14 @@ test('detects deleted records', async () => {
   assert.ok(result.failures.some((f) => f.reason.includes('broken link')))
 })
 
+test('concurrent appends do not fork the chain', async () => {
+  const log = await tmpLog()
+  await Promise.all(Array.from({ length: 20 }, (_, i) => appendRecord(log, 's1', 'Parallel', { i })))
+  const result = verifyChain(await readLog(log))
+  assert.equal(result.ok, true)
+  assert.equal(result.count, 20)
+})
+
 test('root changes when history changes', async () => {
   const log1 = await tmpLog()
   const log2 = await tmpLog()
