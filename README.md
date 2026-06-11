@@ -30,6 +30,8 @@ Be clear-eyed about the trust model:
 
 What you get today: after a seal exists, nobody (agent, operator, or you) can rewrite the sealed history without detection, and the original stays publicly retrievable. That's the claim, the whole claim.
 
+Concrete scenarios where that claim is worth money: [docs/EXAMPLE_USECASES.md](docs/EXAMPLE_USECASES.md).
+
 ## Quick start
 
 ```bash
@@ -66,7 +68,7 @@ env: AFR_DIR (default ./.afr), AFR_NETWORK (calibration|mainnet), PRIVATE_KEY,
 
 This repo's [`.claude/settings.json`](.claude/settings.json) wires `afr record` into the `UserPromptSubmit`, `PostToolUse`, and `Stop` hooks. Open Claude Code in this directory and every action it takes lands in `.afr/log.jsonl`, chained. Copy that hooks block into any project to give its agent a flight recorder.
 
-Privacy: records commit to full tool inputs/outputs via SHA-256 digests. Cleartext previews are OFF by default; set `AFR_PREVIEW=1` to include the first 140 chars of prompts/inputs. Sealing publishes the whole log to public storage, permanently.. whatever is in the log is what you're publishing. Digest-only records let you prove what an agent did and reveal a preimage only when challenged. Note the digests are unsalted, so low-entropy inputs (short commands, common prompts) can be dictionary-checked; treat digests as commitments, not encryption.
+Privacy: records commit to full tool inputs/outputs via SHA-256 digests. Cleartext previews are OFF by default; set `AFR_PREVIEW=1` to include the first 140 chars of prompts/inputs. Sealing publishes the whole log to public storage, permanently.. whatever is in the log is what you're publishing. Digest-only records let you prove what an agent did and reveal a preimage only when challenged. Note the digests are unsalted, so low-entropy inputs (short commands, common prompts) can be dictionary-checked; treat digests as commitments, not encryption. [docs/PRIVACY_AND_ENCRYPTION.md](docs/PRIVACY_AND_ENCRYPTION.md) covers the fix (salted commitments) and the encrypted-seal design for logs that can't be public at all.
 
 ## How tampering is caught
 
